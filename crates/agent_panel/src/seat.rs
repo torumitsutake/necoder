@@ -156,6 +156,15 @@ impl AgentPanel {
             thread.name.as_ref() == name
                 || aliases.iter().any(|alias| alias == thread.name.as_ref())
         }) {
+            // 名前で引き当てるスレッドの名前は会話名で動かしてはいけない（`ensure_named_thread` と同じ）。
+            // 印の無い行（印を DB に残す前に作った Captain 等）には付け直す。
+            let newly_marked = self
+                .threads
+                .get_mut(index)
+                .is_some_and(|thread| !std::mem::replace(&mut thread.name_is_custom, true));
+            if newly_marked {
+                self.persist_custom_name(index);
+            }
             return index;
         }
         let index = self.threads.len();
@@ -165,8 +174,36 @@ impl AgentPanel {
         apply_agent_sticky(&mut thread, cx);
         thread.name_is_custom = true;
         self.threads.push(thread);
+        // 印はメモリだけでなく DB にも（再起動後に会話名で上書きされ、名前で見つからなくなるのを防ぐ）。
+        self.persist_thread_meta(index);
+        self.persist_custom_name(index);
         cx.notify();
         index
+    }
+
+    /// 席のスレッドの名前を席の名前へ戻す（`names` のどれかなら今のまま）。会話名で化けた名前の修復用。
+    pub fn restore_seat_thread_name(
+        &mut self,
+        index: usize,
+        name: &str,
+        names: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.threads.get_mut(index) else {
+            return;
+        };
+        let renamed = !names.iter().any(|known| known == thread.name.as_ref());
+        if renamed {
+            thread.name = SharedString::from(name.to_string());
+        }
+        let newly_marked = !std::mem::replace(&mut thread.name_is_custom, true);
+        if renamed {
+            self.persist_thread_meta(index);
+            cx.notify();
+        }
+        if renamed || newly_marked {
+            self.persist_custom_name(index);
+        }
     }
 
     /// スレッドが話すエージェントの表示名。
@@ -188,6 +225,7 @@ impl AgentPanel {
             self.prompt_context.remove(&id);
         }
         self.persist_thread(index);
+        self.persist_custom_name(index);
         cx.notify();
     }
 
