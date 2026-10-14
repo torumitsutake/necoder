@@ -48,6 +48,16 @@ pub(crate) fn captain_thread_names() -> Vec<String> {
         .collect()
 }
 
+/// panel の中の Captain スレッド（席 → 名前の順）。表示（⚑ タブ・トークン）が席のスレッドを指すために使う。
+/// 名前だけで探すと、名前が化けた席のスレッドを普通の Task タブとして並べてしまう。
+pub(crate) fn captain_thread_in(panel: &AgentPanel) -> Option<usize> {
+    panel.seat_thread(CAPTAIN_SEAT).or_else(|| {
+        captain_thread_names()
+            .iter()
+            .find_map(|name| panel.thread_index_named(name))
+    })
+}
+
 /// Captain スレッドの名前か（ロケール横断）。
 pub(crate) fn is_captain_thread_name(name: &str) -> bool {
     captain_thread_names().iter().any(|known| known == name)
@@ -307,6 +317,8 @@ impl Workspace {
             if let Some(seat) = seat {
                 panel.assign_seat(index, seat, cx);
             }
+            // 席のスレッドは常に「Captain」（会話名で別 Task の名前に化けていたら戻す）。
+            panel.restore_seat_thread_name(index, &captain_thread_name(), &names, cx);
             panel.set_prompt_context(index, context);
             index
         });
@@ -682,11 +694,7 @@ impl Workspace {
             .fleet_agents
             .first()?
             .read(cx);
-        let thread = panel.seat_thread(CAPTAIN_SEAT).or_else(|| {
-            captain_thread_names()
-                .iter()
-                .find_map(|name| panel.thread_index_named(name))
-        })?;
+        let thread = captain_thread_in(panel)?;
         Some(panel.thread_tokens(thread).0)
     }
 }

@@ -231,7 +231,7 @@ impl Workspace {
         let appointing = bridge && self.chrome.captain_appointing && captain_agent.is_none();
         if bridge {
             let main_panel = session.fleet_agents[0].clone();
-            let captain_thread = main_panel.read(cx).statuses().iter().position(|status| captain::is_captain_thread_name(&status.name));
+            let captain_thread = captain::captain_thread_in(main_panel.read(cx));
             let selected = (wide || side.is_none()) && match (&captain_agent, captain_thread) {
                 (Some(_), Some(thread)) => main_panel == conversation && main_panel.read(cx).active_thread() == thread,
                 _ => appointing,
@@ -247,10 +247,11 @@ impl Workspace {
                 .tooltip(Tooltip::text(i18n::t!("captain.tab_tip"), self.theme.clone()))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.focus_captain(&FocusCaptain, window, cx))));
         }
+        // 任命中の Captain スレッドは上の ⚑ タブが表す（二重に並べない）。名前でなく席で見分ける。
+        let seated_captain = (bridge && captain_agent.is_some()).then(|| session.fleet_agents.first().and_then(|panel| captain::captain_thread_in(panel.read(cx)).map(|thread| (panel.clone(), thread)))).flatten();
         for panel in &session.fleet_agents {
             for (thread, status) in panel.read(cx).statuses().into_iter().enumerate() {
-                // 任命中の Captain スレッドは上の ⚑ タブが表す（二重に並べない）。
-                if bridge && captain_agent.is_some() && captain::is_captain_thread_name(&status.name) { continue; }
+                if seated_captain.as_ref().is_some_and(|(captain_panel, captain_thread)| captain_panel == panel && *captain_thread == thread) { continue; }
                 // 狭いカードでサイドペインが全面に出ている間は、どのスレッドも「選択中」に見せない（押すと会話へ戻る）。
                 let selected = !appointing && panel == &conversation && panel.read(cx).active_thread() == thread && (wide || side.is_none());
                 let panel = panel.clone();

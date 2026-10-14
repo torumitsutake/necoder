@@ -3303,7 +3303,10 @@ PYEOF"#;
                     if let Some(index) = panel.thread_index_by_id(&thread_id) {
                         let thread = &mut panel.threads[index];
                         // 生成待ちの間にユーザーが手動改名していたら尊重する。
-                        if !thread.name_is_custom && is_placeholder_name(&thread.name) {
+                        if !thread.name_is_custom
+                            && thread.seat.is_none()
+                            && is_placeholder_name(&thread.name)
+                        {
                             let name = SharedString::from(name);
                             thread.name = name.clone();
                             cx.emit(PanelEvent::ThreadAutoNamed { name });
@@ -3319,14 +3322,17 @@ PYEOF"#;
         .detach();
     }
 
-    /// necoder 自前の命名（`claude -p` 等）が要るスレッドか: 人が名前を付けていない・まだ既定名・
-    /// その agent が会話名を自分で送ってこない（O2）。
+    /// necoder 自前の命名（`claude -p` 等）が要るスレッドか: 人が名前を付けていない・席に座っていない
+    /// （席の名前は固定）・まだ既定名・その agent が会話名を自分で送ってこない（O2）。
     fn needs_own_auto_name(&self, thread: &Thread) -> bool {
         let agent_names_itself = self
             .catalog
             .get(&thread.agent)
             .is_some_and(|advertisement| advertisement.sends_titles);
-        !thread.name_is_custom && is_placeholder_name(&thread.name) && !agent_names_itself
+        !thread.name_is_custom
+            && thread.seat.is_none()
+            && is_placeholder_name(&thread.name)
+            && !agent_names_itself
     }
 
     /// このパスを触ったスレッドの色（色リンク・M12-4）。複数スレッドなら最後に触った方。
@@ -7695,9 +7701,14 @@ PYEOF"#;
                 // いる人の名前も動かさない（エージェントの命名も「自動命名」のうち）。
                 // null（名前を消した）は何もしない＝今の名前を保つ。既定名へ戻すと付いていた
                 // 名前が消え、自前の命名で付け直すのは余計な課金になるため。
+                // 席のスレッド（Captain）の名前は席の名前で固定（会話の話題で別 Task の名前に化けない）。
                 let auto_name = settings::get(cx).agent_auto_name;
                 if let Some(title) = title.as_deref().and_then(agent_title_for_tab) {
-                    if auto_name && !thread.name_is_custom && thread.name != title {
+                    if auto_name
+                        && !thread.name_is_custom
+                        && thread.seat.is_none()
+                        && thread.name != title
+                    {
                         thread.name = title.clone();
                         agent_renamed = Some(title);
                     }
@@ -15478,6 +15489,79 @@ PYEOF"#;
             assert_eq!(panel.seat_thread("captain"), None);
         });
         let _ = std::fs::remove_file(settings_path);
+    }
+
+    /// 席のスレッド（Captain）は自動命名で名前が変わらない。印の無い（DB に印が残っていなかった）
+    /// 席のスレッドでも、エージェントの会話名・自前の命名のどちらでも上書きされない。化けた名前は
+    /// `restore_seat_thread_name` で席の名前へ戻る。
+    #[gpui::test]
+    fn a_seat_thread_keeps_its_name_against_auto_naming(cx: &mut gpui::TestAppContext) {
+        let settings_path = init_test_settings(cx, "seat_name");
+        let (panel, cx) = cx.add_window_view(|_window, cx| AgentPanel::new(Theme::dark(), cx));
+        panel.update(cx, |panel, cx| {
+            let names = vec!["Captain".to_string()];
+            let index = panel.ensure_named_thread_quietly("Captain", &names, "Claude Code", cx);
+            panel.assign_seat(index, test_seat(Vec::new()), cx);
+            // 再起動後の復元を再現: 印が DB に無かった頃の行は name_is_custom = false で戻る。
+            panel.threads[index].name_is_custom = false;
+            panel.threads[index].entries.push(Entry::User("ne . の不具合を Task にして".into()));
+            assert!(
+                !panel.needs_own_auto_name(&panel.threads[index]),
+                "席のスレッドには自前の命名を走らせない"
+            );
+            panel.on_event(
+                index,
+                AgentEvent::TitleChanged(Some("ne . カレントフォルダー起動不具合".into())),
+                cx,
+            );
+            assert_eq!(panel.threads[index].name.as_ref(), "Captain");
+            assert_eq!(panel.statuses()[index].name.as_ref(), "Captain", "タブの名前も");
+
+            // 名前で引き当て直すと印が付き直る（席を外しても会話名で動かない）。
+            assert_eq!(
+                panel.ensure_named_thread_quietly("Captain", &names, "Claude Code", cx),
+                index
+            );
+            assert!(panel.threads[index].name_is_custom);
+
+            // 前のビルドで化けてしまった名前は、席の名前へ戻す。
+            panel.threads[index].name = "ne . カレントフォルダー起動不具合".into();
+            panel.threads[index].name_is_custom = false;
+            panel.restore_seat_thread_name(index, "Captain", &names, cx);
+            assert_eq!(panel.threads[index].name.as_ref(), "Captain");
+            assert!(panel.threads[index].name_is_custom);
+            assert_eq!(panel.seat_thread("captain"), Some(index), "戻しても席は動かない");
+        });
+        let _ = std::fs::remove_file(settings_path);
+    }
+
+    /// 名前で用意した席のスレッドの印は DB に残り、再起動後も会話名で上書きされない。
+    #[gpui::test]
+    fn a_quietly_named_thread_keeps_its_name_after_restart(cx: &mut gpui::TestAppContext) {
+        let settings_path = init_test_settings(cx, "seat_name_restart");
+        let db_path = std::env::temp_dir().join(format!(
+            "necoder_seat_name_restart_{}_{}.db",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let storage = storage::Storage::open(&db_path).expect("DB を開ける");
+        let (panel, cx) = cx.add_window_view(|_window, cx| AgentPanel::new(Theme::dark(), cx));
+        let id = panel.update(cx, |panel, cx| {
+            panel.set_storage(storage.clone(), cx);
+            let index =
+                panel.ensure_named_thread_quietly("Captain", &["Captain".to_string()], "Claude Code", cx);
+            panel.threads[index].id.clone()
+        });
+        let (restarted, cx) = cx.add_window_view(|_window, cx| AgentPanel::new(Theme::dark(), cx));
+        restarted.update(cx, |panel, cx| {
+            panel.set_storage(storage.clone(), cx);
+            let index = panel.thread_index_by_id(&id).expect("Captain スレッドが復元される");
+            assert!(panel.threads[index].name_is_custom, "印も復元される");
+            panel.on_event(index, AgentEvent::TitleChanged(Some("別の Task".into())), cx);
+            assert_eq!(panel.threads[index].name.as_ref(), "Captain");
+        });
+        let _ = std::fs::remove_file(settings_path);
+        let _ = std::fs::remove_file(&db_path);
     }
 
     /// 会話の交代（FLEET-V2 §5.6）: 送信路と会話 id を捨てて区切りを残す。実行中は交代しない。
